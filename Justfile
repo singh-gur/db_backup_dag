@@ -27,3 +27,6 @@ all-tags:
     @echo "Git Branch: {{ GIT_BRANCH }}"
     @echo "Primary Tag: {{ PRIMARY_TAG }}"
     @echo "Tags to push: latest, {{ GIT_BRANCH }}, {{ PRIMARY_TAG }}"
+
+run-help:
+    @echo "docker run --rm {{ REGISTRY }}/{{ IMAGE }}:{{ PRIMARY_TAG }} --help"
