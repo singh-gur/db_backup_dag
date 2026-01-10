@@ -1,0 +1,40 @@
+{
+  "name": "Airflow Dev Environment",
+  "image": "mcr.microsoft.com/devcontainers/base:bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.13",
+      "pip": true
+    },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "dockerDashComposeVersion": "v2",
+      "enableNonRootDocker": "true",
+      "moby": "true"
+    }
+  },
+  "postCreateCommand": "pip install --no-cache-dir apache-airflow apache-airflow-providers-docker ruff && export AIRFLOW_HOME=/home/vscode/airflow && mkdir -p $AIRFLOW_HOME/logs $AIRFLOW_HOME/plugins && airflow db init && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com 2>/dev/null || true",
+  "remoteUser": "vscode",
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/${localWorkspaceFolderBasename},type=bind",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker",
+        "shardulm94.trailing-spaces"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.envFile": "${env:HOME}/.env"
+      }
+    }
+  },
+  "portsAttributes": {
+    "8080": {
+      "label": "Airflow Web UI",
+      "protocol": "http",
+      "onAutoForward": "notify"
+    }
+  },
+  "initializeCommand": "docker build -t pg-s3-backup:dev ."
+}
