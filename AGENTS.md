@@ -8,6 +8,7 @@ This is a PostgreSQL S3 backup tool consisting of:
 - `scripts/pg_s3_backup` - Main bash script for database backups
 - `Dockerfile` - Container image definition
 - `Justfile` - Build and publish automation
+- `dags/pg_s3_backup.py` - Airflow DAG for scheduling backups
 
 ## Build Commands
 
@@ -205,3 +206,24 @@ docker run --rm \
 2. Create git tag: `git tag -a v1.0.0 -m "Release v1.0.0"`
 3. Run `just release`
 4. Push tags: `git push --tags`
+
+## Airflow DAG
+
+### Required Airflow Variables
+Set these in Airflow Admin > Variables:
+- `aws_access_key_id` - AWS access key
+- `aws_secret_access_key` - AWS secret key
+- `aws_region` - AWS region (default: us-east-1)
+- `s3_backup_bucket` - S3 bucket name
+- `s3_backup_prefix` - S3 prefix (default: backups/)
+- `pg_host` - PostgreSQL host
+- `pg_port` - PostgreSQL port (default: 5432)
+- `pg_database` - Database name
+- `pg_user` - Database user
+- `pg_password` - Database password
+
+### DAG Configuration
+- **Schedule**: Daily at 2:00 AM (`0 2 * * *`)
+- **Retries**: 2 with 5 minute delay
+- **Docker**: Uses DockerOperator with auto_remove
+- **Mounts**: Binds /tmp for temporary files
