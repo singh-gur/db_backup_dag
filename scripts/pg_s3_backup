@@ -1,0 +1,413 @@
+#!/bin/bash
+
+set -e
+set -u
+set -o pipefail
+
+echo "Postgres S3 Backup Script"
+
+HOST="localhost"
+PORT="5432"
+DBNAME="postgres"
+ALL_DB="false"
+USER="postgres"
+PASSWORD=""
+S3_BUCKET=""
+S3_PREFIX=""
+AWS_PROFILE="default"
+AWS_ACCESS_KEY_ID=""
+AWS_SECRET_ACCESS_KEY=""
+AWS_REGION="us-east-1"
+AWS_ENDPOINT_URL=""
+COMPRESS="false"
+KEEP_LOCAL="false"
+TEMP_DIR="/tmp"
+
+CLEANUP_FILES=()
+
+cleanup() {
+    local exit_code=$?
+    echo "Cleaning up temporary files..."
+    for file in "${CLEANUP_FILES[@]}"; do
+        if [[ -f "$file" ]]; then
+            rm -f "$file"
+            echo "Removed: $file"
+        fi
+    done
+    exit $exit_code
+}
+
+trap cleanup EXIT
+
+validate_dependencies() {
+    local missing_deps=()
+    
+    if ! command -v pg_dump >/dev/null 2>&1; then
+        missing_deps+=("postgresql-client")
+    fi
+    
+    if ! command -v pg_dumpall >/dev/null 2>&1; then
+        missing_deps+=("postgresql-client")
+    fi
+    
+    if ! command -v aws >/dev/null 2>&1; then
+        missing_deps+=("awscli")
+    fi
+    
+    if [[ "$COMPRESS" == "true" ]] && ! command -v gzip >/dev/null 2>&1; then
+        missing_deps+=("gzip")
+    fi
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing_deps[*]}" >&2
+        echo "Please install the missing packages and try again." >&2
+        exit 1
+    fi
+}
+
+usage() {
+    cat << EOF
+usage: pg_s3_backup [options]
+
+Required:
+  --bucket BUCKET          S3 Bucket to upload the backup
+
+Optional:
+  --host HOST               Hostname of the postgres server (default: $HOST)
+  --port PORT               Port of the postgres server (default: $PORT)
+  -d, --dbname DATABASE     Name of the database to backup (default: $DBNAME)
+  -a, --all                 Backup all databases
+  -u, --user USERNAME       Username to connect to the database (default: $USER)
+  -w, --password PASSWORD   Password to connect to the database
+  --prefix PREFIX          S3 Prefix to upload the backup (default: $S3_PREFIX)
+  --aws-profile PROFILE    AWS Profile to use for the upload (default: $AWS_PROFILE)
+  --aws-access-key-id KEY  AWS Access Key ID (overrides profile)
+  --aws-secret-key SECRET  AWS Secret Access Key (overrides profile)
+  --aws-region REGION      AWS Region (default: us-east-1)
+  --aws-endpoint-url URL   Custom AWS endpoint URL (for S3-compatible services)
+  --compress                Enable gzip compression
+  --keep-local              Keep local backup file after upload
+  --temp-dir DIR            Temporary directory for backup files (default: $TEMP_DIR)
+  -h, --help                Show this help message
+
+Examples:
+  $0 --bucket my-backups --dbname mydb
+  $0 --bucket my-backups --all --prefix production/
+  $0 --bucket my-backups --host db.example.com --user admin --password secret
+  $0 --bucket my-backups --dbname mydb --aws-access-key-id AKIAXXXXXXXX --aws-secret-key secretkey
+  $0 --bucket my-backups --dbname mydb --aws-access-key-id AKIAXXXXXXXX --aws-secret-key secretkey --aws-endpoint-url http://localhost:9000
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --host)
+            HOST="$2"
+            shift 2
+            ;;
+        --host=*)
+            HOST="${1#*=}"
+            shift
+            ;;
+        --port)
+            PORT="$2"
+            shift 2
+            ;;
+        --port=*)
+            PORT="${1#*=}"
+            shift
+            ;;
+        -d|--dbname)
+            DBNAME="$2"
+            shift 2
+            ;;
+        -d=*|--dbname=*)
+            DBNAME="${1#*=}"
+            shift
+            ;;
+        -a|--all)
+            ALL_DB="true"
+            DBNAME="all"
+            shift
+            ;;
+        -u|--user)
+            USER="$2"
+            shift 2
+            ;;
+        -u=*|--user=*)
+            USER="${1#*=}"
+            shift
+            ;;
+        -w|--password)
+            PASSWORD="$2"
+            shift 2
+            ;;
+        -w=*|--password=*)
+            PASSWORD="${1#*=}"
+            shift
+            ;;
+        --bucket)
+            S3_BUCKET="$2"
+            shift 2
+            ;;
+        --bucket=*)
+            S3_BUCKET="${1#*=}"
+            shift
+            ;;
+        --prefix)
+            S3_PREFIX="$2"
+            shift 2
+            ;;
+        --prefix=*)
+            S3_PREFIX="${1#*=}"
+            shift
+            ;;
+        --aws-profile)
+            AWS_PROFILE="$2"
+            shift 2
+            ;;
+        --aws-profile=*)
+            AWS_PROFILE="${1#*=}"
+            shift
+            ;;
+        --aws-access-key-id)
+            AWS_ACCESS_KEY_ID="$2"
+            shift 2
+            ;;
+        --aws-access-key-id=*)
+            AWS_ACCESS_KEY_ID="${1#*=}"
+            shift
+            ;;
+        --aws-secret-key)
+            AWS_SECRET_ACCESS_KEY="$2"
+            shift 2
+            ;;
+        --aws-secret-key=*)
+            AWS_SECRET_ACCESS_KEY="${1#*=}"
+            shift
+            ;;
+        --aws-region)
+            AWS_REGION="$2"
+            shift 2
+            ;;
+        --aws-region=*)
+            AWS_REGION="${1#*=}"
+            shift
+            ;;
+        --aws-endpoint-url)
+            AWS_ENDPOINT_URL="$2"
+            shift 2
+            ;;
+        --aws-endpoint-url=*)
+            AWS_ENDPOINT_URL="${1#*=}"
+            shift
+            ;;
+        --compress)
+            COMPRESS="true"
+            shift
+            ;;
+        --keep-local)
+            KEEP_LOCAL="true"
+            shift
+            ;;
+        --temp-dir)
+            TEMP_DIR="$2"
+            shift 2
+            ;;
+        --temp-dir=*)
+            TEMP_DIR="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
+    esac
+done
+
+validate_parameters() {
+    if [[ -z "$S3_BUCKET" ]]; then
+        echo "Error: S3 bucket is required. Use --bucket" >&2
+        exit 1
+    fi
+    
+    # Validate AWS authentication method
+    local using_inline_creds=false
+    if [[ -n "$AWS_ACCESS_KEY_ID" || -n "$AWS_SECRET_ACCESS_KEY" || -n "$AWS_ENDPOINT_URL" ]]; then
+        using_inline_creds=true
+    fi
+    
+    if [[ "$using_inline_creds" == true ]]; then
+        # When using inline credentials, both access key and secret key are required
+        if [[ -z "$AWS_ACCESS_KEY_ID" ]]; then
+            echo "Error: AWS Access Key ID is required when using inline credentials. Use --aws-access-key-id" >&2
+            exit 1
+        fi
+        if [[ -z "$AWS_SECRET_ACCESS_KEY" ]]; then
+            echo "Error: AWS Secret Access Key is required when using inline credentials. Use --aws-secret-key" >&2
+            exit 1
+        fi
+        echo "Using inline AWS credentials"
+    else
+        # Using AWS profile authentication (default behavior)
+        echo "Using AWS profile: $AWS_PROFILE"
+    fi
+    
+    if [[ ! -d "$TEMP_DIR" ]]; then
+        echo "Error: Temporary directory '$TEMP_DIR' does not exist" >&2
+        exit 1
+    fi
+    
+    if [[ ! -w "$TEMP_DIR" ]]; then
+        echo "Error: Temporary directory '$TEMP_DIR' is not writable" >&2
+        exit 1
+    fi
+}
+
+create_pgpass_file() {
+    if [[ -n "$PASSWORD" ]]; then
+        PGPASS_FILE="$TEMP_DIR/.pgpass.$$"
+        echo "$HOST:$PORT:*:$USER:$PASSWORD" > "$PGPASS_FILE"
+        chmod 600 "$PGPASS_FILE"
+        CLEANUP_FILES+=("$PGPASS_FILE")
+        export PGPASSFILE="$PGPASS_FILE"
+    fi
+}
+
+perform_backup() {
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local base_filename="${DBNAME}-${timestamp}"
+    local sql_file="$TEMP_DIR/${base_filename}.sql"
+    
+    CLEANUP_FILES+=("$sql_file")
+    
+    echo "Starting backup at $(date)"
+    echo "Database: $DBNAME"
+    echo "Host: $HOST:$PORT"
+    echo "User: $USER"
+    echo "Output file: $sql_file"
+    
+    if [[ "$ALL_DB" == "true" ]]; then
+        echo "Performing full cluster backup (all databases)..."
+        if ! pg_dumpall -h "$HOST" -p "$PORT" -U "$USER" -w -v -f "$sql_file"; then
+            echo "Error: pg_dumpall failed" >&2
+            exit 1
+        fi
+    else
+        echo "Performing single database backup..."
+        if ! pg_dump -h "$HOST" -p "$PORT" -U "$USER" -d "$DBNAME" -w -b -v -f "$sql_file"; then
+            echo "Error: pg_dump failed" >&2
+            exit 1
+        fi
+    fi
+    
+    if [[ ! -s "$sql_file" ]]; then
+        echo "Error: Backup file is empty or was not created" >&2
+        exit 1
+    fi
+    
+    local file_size=$(du -h "$sql_file" | cut -f1)
+    echo "Backup completed successfully. File size: $file_size"
+    
+    local upload_file="$sql_file"
+    
+    if [[ "$COMPRESS" == "true" ]]; then
+        echo "Compressing backup..."
+        if ! gzip "$sql_file"; then
+            echo "Error: Compression failed" >&2
+            exit 1
+        fi
+        upload_file="${sql_file}.gz"
+        CLEANUP_FILES+=("$upload_file")
+        local compressed_size=$(du -h "$upload_file" | cut -f1)
+        echo "Compression completed. Compressed size: $compressed_size"
+    fi
+    
+    upload_to_s3 "$upload_file"
+    
+    if [[ "$KEEP_LOCAL" == "false" ]]; then
+        echo "Removing local backup file: $upload_file"
+    else
+        echo "Keeping local backup file: $upload_file"
+        for i in "${!CLEANUP_FILES[@]}"; do
+            if [[ "${CLEANUP_FILES[i]}" == "$upload_file" ]]; then
+                unset 'CLEANUP_FILES[i]'
+            fi
+        done
+    fi
+}
+
+upload_to_s3() {
+    local file_path="$1"
+    local filename=$(basename "$file_path")
+    local s3_key="$S3_PREFIX$filename"
+    
+    if [[ -n "$S3_PREFIX" && ! "$S3_PREFIX" =~ /$ ]]; then
+        s3_key="$S3_PREFIX/$filename"
+    fi
+    
+    echo "Uploading to S3..."
+    echo "Source: $file_path"
+    echo "Destination: s3://$S3_BUCKET/$s3_key"
+    
+    local aws_cmd="aws s3 cp \"$file_path\" \"s3://$S3_BUCKET/$s3_key\""
+    
+    # Determine authentication method and build AWS command
+    local aws_cmd="aws s3 cp \"$file_path\" \"s3://$S3_BUCKET/$s3_key\""
+    local using_inline_creds=false
+    
+    # Check if using inline credentials
+    if [[ -n "$AWS_ACCESS_KEY_ID" ]]; then
+        using_inline_creds=true
+        export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+        export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+        export AWS_DEFAULT_REGION="$AWS_REGION"
+    fi
+    
+    # Add endpoint URL if specified
+    if [[ -n "$AWS_ENDPOINT_URL" ]]; then
+        echo "Using custom endpoint: $AWS_ENDPOINT_URL"
+        if [[ "$using_inline_creds" == true ]]; then
+            if ! aws s3 cp "$file_path" "s3://$S3_BUCKET/$s3_key" --endpoint-url "$AWS_ENDPOINT_URL"; then
+                echo "Error: S3 upload failed" >&2
+                exit 1
+            fi
+        else
+            if ! aws s3 cp "$file_path" "s3://$S3_BUCKET/$s3_key" --profile "$AWS_PROFILE" --endpoint-url "$AWS_ENDPOINT_URL"; then
+                echo "Error: S3 upload failed" >&2
+                exit 1
+            fi
+        fi
+    else
+        # Standard AWS S3 endpoint
+        if [[ "$using_inline_creds" == true ]]; then
+            if ! aws s3 cp "$file_path" "s3://$S3_BUCKET/$s3_key"; then
+                echo "Error: S3 upload failed" >&2
+                exit 1
+            fi
+        else
+            if ! aws s3 cp "$file_path" "s3://$S3_BUCKET/$s3_key" --profile "$AWS_PROFILE"; then
+                echo "Error: S3 upload failed" >&2
+                exit 1
+            fi
+        fi
+    fi
+    
+    echo "Upload completed successfully"
+    echo "S3 URL: s3://$S3_BUCKET/$s3_key"
+}
+
+main() {
+    validate_dependencies
+    validate_parameters
+    create_pgpass_file
+    perform_backup
+    echo "Backup operation completed successfully at $(date)"
+}
+
+main "$@"
